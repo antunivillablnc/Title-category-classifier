@@ -1,11 +1,15 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, Response, redirect, url_for, session
 import joblib
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 import os
+from functools import wraps
+from datetime import datetime, timedelta
+from collections import Counter
 
 app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your-secret-key-here'  # Required for sessions
 
 # Initialize the model and vectorizer
 vectorizer = TfidfVectorizer(max_features=5000)
@@ -42,6 +46,32 @@ SAMPLE_DATA = {
     ]
 }
 
+# In-memory history log
+history_log = []
+
+# Simple basic auth
+USERNAME = 'professor'
+PASSWORD = 'secret123'
+
+def check_auth(username, password):
+    return username == USERNAME and password == PASSWORD
+
+def authenticate():
+    return Response(
+        'Could not verify your access level for that URL.\n'
+        'You have to login with proper credentials', 401,
+        {'WWW-Authenticate': 'Basic realm="Login Required"',
+         'Cache-Control': 'no-store, no-cache, must-revalidate, post-check=0, pre-check=0'})
+
+def requires_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth = request.authorization
+        if not auth or not check_auth(auth.username, auth.password):
+            return authenticate()
+        return f(*args, **kwargs)
+    return decorated
+
 def train_model():
     # Prepare training data
     texts = []
@@ -71,6 +101,20 @@ else:
 def home():
     return render_template('index.html', categories=CATEGORIES)
 
+def get_predictions(title, abstract):
+    text = f"{title} {abstract}"
+    X = vectorizer.transform([text])
+    prediction = model.predict(X)[0]
+    probabilities = model.predict_proba(X)[0]
+    top_indices = np.argsort(probabilities)[-3:][::-1]
+    return [
+        {
+            'category': model.classes_[idx],
+            'probability': float(probabilities[idx])
+        }
+        for idx in top_indices
+    ]
+
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
@@ -78,36 +122,85 @@ def predict():
         title = data.get('title', '')
         abstract = data.get('abstract', '')
         
-        # Combine title and abstract
-        text = f"{title} {abstract}"
+        # Check for duplicates
+        is_duplicate = any(
+            entry['title'] == title and entry['abstract'] == abstract 
+            for entry in history_log
+        )
         
-        # Transform the input text
-        X = vectorizer.transform([text])
-        
-        # Make prediction
-        prediction = model.predict(X)[0]
-        probabilities = model.predict_proba(X)[0]
-        
-        # Get top 3 predictions with probabilities
-        top_indices = np.argsort(probabilities)[-3:][::-1]
-        top_predictions = [
-            {
-                'category': model.classes_[idx],
-                'probability': float(probabilities[idx])
-            }
-            for idx in top_indices
-        ]
-        
-        return jsonify({
-            'success': True,
-            'predictions': top_predictions
-        })
-    
+        if not is_duplicate:
+            # Get predictions
+            predictions = get_predictions(title, abstract)
+            
+            # Add to history log
+            history_log.append({
+                'title': title,
+                'abstract': abstract,
+                'predictions': predictions,
+                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            })
+            
+            return jsonify({
+                'success': True,
+                'predictions': predictions
+            })
+        else:
+            # If duplicate, just return predictions without adding to history
+            predictions = get_predictions(title, abstract)
+            return jsonify({
+                'success': True,
+                'predictions': predictions,
+                'message': 'This paper was already classified before'
+            })
+            
     except Exception as e:
         return jsonify({
             'success': False,
             'error': str(e)
-        }), 500
+        })
+
+@app.route('/history')
+@requires_auth
+def history():
+    # Calculate statistics
+    total_papers = len(history_log)
+    
+    # Get unique categories
+    all_categories = []
+    for entry in history_log:
+        all_categories.extend([pred['category'] for pred in entry['predictions']])
+    unique_categories = list(set(all_categories))
+    
+    # Calculate average confidence
+    total_confidence = 0
+    confidence_count = 0
+    for entry in history_log:
+        for pred in entry['predictions']:
+            total_confidence += pred['probability'] * 100
+            confidence_count += 1
+    avg_confidence = total_confidence / confidence_count if confidence_count > 0 else 0
+    
+    # Count recent papers (last 24 hours)
+    recent_time = datetime.now() - timedelta(hours=24)
+    recent_count = sum(1 for entry in history_log 
+                      if datetime.strptime(entry['timestamp'], '%Y-%m-%d %H:%M:%S') > recent_time)
+    
+    # Get category distribution
+    category_counter = Counter(all_categories)
+    top_categories = category_counter.most_common(5)
+    
+    # Prepare data for pie chart
+    category_labels = list(category_counter.keys())
+    category_counts = list(category_counter.values())
+    
+    return render_template('history.html',
+                         history=history_log,
+                         unique_categories=unique_categories,
+                         avg_confidence=avg_confidence,
+                         recent_count=recent_count,
+                         top_categories=top_categories,
+                         category_labels=category_labels,
+                         category_counts=category_counts)
 
 if __name__ == '__main__':
     app.run(debug=True) 
